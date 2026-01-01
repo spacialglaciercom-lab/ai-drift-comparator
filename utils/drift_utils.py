@@ -4,30 +4,163 @@ Drift detection utilities using Evidently AI and Deepchecks.
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from evidently.report import Report
-from evidently.test_suite import TestSuite
 from deepchecks.tabular import Dataset
 from deepchecks.tabular.checks import DataDrift
 import json
 
+# Try to import Evidently with fallback for different versions
+HAS_EVIDENTLY = False
+HAS_EVIDENTLY_REPORT = False
+HAS_DATA_DRIFT_TABLE = False
+HAS_DATASET_DRIFT_METRIC = False
+HAS_TEST_NUMBER_OF_DRIFTED = False
+Report = None
+TestSuite = None
+DataDriftTable = None
+ColumnDriftMetric = None
+DatasetDriftMetric = None
+TestNumberOfDriftedFeatures = None
+
+# Try importing Evidently Report (new API)
+try:
+    from evidently.report import Report
+    HAS_EVIDENTLY_REPORT = True
+    HAS_EVIDENTLY = True
+except ImportError:
+    # Try old API
+    try:
+        from evidently.dashboard import Dashboard
+        from evidently.tabs import DataDriftTab
+        HAS_EVIDENTLY = True
+    except ImportError:
+        pass
+
 # Try to import Evidently metrics with fallback for different versions
-try:
-    from evidently.metrics import DataDriftTable, ColumnDriftMetric
-    HAS_DATA_DRIFT_TABLE = True
-except ImportError:
-    HAS_DATA_DRIFT_TABLE = False
+if HAS_EVIDENTLY:
+    try:
+        from evidently.metrics import DataDriftTable, ColumnDriftMetric
+        HAS_DATA_DRIFT_TABLE = True
+    except ImportError:
+        try:
+            # Try alternative import paths
+            from evidently.metric_preset import DataDriftPreset
+            HAS_DATA_DRIFT_TABLE = True
+        except ImportError:
+            pass
 
-try:
-    from evidently.metrics import DatasetDriftMetric
-    HAS_DATASET_DRIFT_METRIC = True
-except ImportError:
-    HAS_DATASET_DRIFT_METRIC = False
+    try:
+        from evidently.metrics import DatasetDriftMetric
+        HAS_DATASET_DRIFT_METRIC = True
+    except ImportError:
+        pass
 
-try:
-    from evidently.tests import TestNumberOfDriftedFeatures
-    HAS_TEST_NUMBER_OF_DRIFTED = True
-except ImportError:
-    HAS_TEST_NUMBER_OF_DRIFTED = False
+    try:
+        from evidently.test_suite import TestSuite
+    except ImportError:
+        pass
+
+    try:
+        from evidently.tests import TestNumberOfDriftedFeatures
+        HAS_TEST_NUMBER_OF_DRIFTED = True
+    except ImportError:
+        pass
+
+
+def _detect_drift_statistical(
+    reference_data: pd.DataFrame,
+    current_data: pd.DataFrame,
+    threshold: float = 0.05,
+) -> Dict:
+    """
+    Fallback drift detection using statistical tests (KS test, etc.)
+    when Evidently is not available.
+    """
+    from scipy import stats
+    
+    feature_drift_scores = {}
+    number_of_drifted_features = 0
+    dataset_drifted = False
+    
+    # Get common columns
+    common_cols = set(reference_data.columns) & set(current_data.columns)
+    
+    for col in common_cols:
+        ref_col = reference_data[col].dropna()
+        curr_col = current_data[col].dropna()
+        
+        if len(ref_col) == 0 or len(curr_col) == 0:
+            continue
+        
+        # Check if numeric
+        if pd.api.types.is_numeric_dtype(ref_col):
+            try:
+                # Kolmogorov-Smirnov test
+                ks_stat, p_value = stats.ks_2samp(ref_col, curr_col)
+                drift_score = 1 - p_value  # Convert p-value to drift score
+                drift_detected = p_value < threshold
+                
+                feature_drift_scores[col] = {
+                    'drift_score': drift_score,
+                    'drift_detected': drift_detected,
+                    'stat_test': 'KS_test',
+                    'p_value': p_value
+                }
+                
+                if drift_detected:
+                    number_of_drifted_features += 1
+                    dataset_drifted = True
+            except Exception:
+                feature_drift_scores[col] = {
+                    'drift_score': 0.0,
+                    'drift_detected': False,
+                    'stat_test': 'Error'
+                }
+        else:
+            # For categorical, use chi-square test
+            try:
+                ref_counts = ref_col.value_counts()
+                curr_counts = curr_col.value_counts()
+                
+                # Align categories
+                all_cats = set(ref_counts.index) | set(curr_counts.index)
+                ref_aligned = [ref_counts.get(cat, 0) for cat in all_cats]
+                curr_aligned = [curr_counts.get(cat, 0) for cat in all_cats]
+                
+                if sum(ref_aligned) > 0 and sum(curr_aligned) > 0:
+                    chi2, p_value = stats.chisquare(curr_aligned, f_exp=ref_aligned)
+                    drift_score = 1 - min(p_value, 1.0)
+                    drift_detected = p_value < threshold
+                    
+                    feature_drift_scores[col] = {
+                        'drift_score': drift_score,
+                        'drift_detected': drift_detected,
+                        'stat_test': 'Chi-square',
+                        'p_value': p_value
+                    }
+                    
+                    if drift_detected:
+                        number_of_drifted_features += 1
+                        dataset_drifted = True
+            except Exception:
+                feature_drift_scores[col] = {
+                    'drift_score': 0.0,
+                    'drift_detected': False,
+                    'stat_test': 'Error'
+                }
+    
+    total_features = len(feature_drift_scores) if feature_drift_scores else 1
+    share_of_drifted_features = number_of_drifted_features / total_features if total_features > 0 else 0.0
+    
+    return {
+        'dataset_drifted': dataset_drifted,
+        'number_of_drifted_features': number_of_drifted_features,
+        'share_of_drifted_features': share_of_drifted_features,
+        'feature_drift_scores': feature_drift_scores,
+        'full_report': {},
+        'drift_table': {},
+        'column_drifts': {},
+        'method': 'statistical_fallback'
+    }
 
 
 def detect_drift_evidently(
@@ -46,9 +179,14 @@ def detect_drift_evidently(
     Returns:
         Dictionary containing drift metrics and results
     """
+    # If Evidently is not available, use statistical fallback
+    if not HAS_EVIDENTLY or not HAS_EVIDENTLY_REPORT or Report is None:
+        return _detect_drift_statistical(reference_data, current_data, threshold)
+    
     try:
-        if not HAS_DATA_DRIFT_TABLE:
-            raise ImportError("DataDriftTable is not available in this version of Evidently")
+        if not HAS_DATA_DRIFT_TABLE or DataDriftTable is None:
+            # Fallback to statistical tests
+            return _detect_drift_statistical(reference_data, current_data, threshold)
         
         # Data drift table (primary method - works in all versions)
         data_drift_table = DataDriftTable()
@@ -108,7 +246,7 @@ def detect_drift_evidently(
         
         # Column-level drift metrics (optional, can be slow for many columns)
         column_drifts = {}
-        if HAS_DATA_DRIFT_TABLE:
+        if HAS_DATA_DRIFT_TABLE and ColumnDriftMetric is not None and Report is not None:
             try:
                 # Only process numeric columns to avoid errors
                 numeric_cols = reference_data.select_dtypes(include=[np.number]).columns[:10]  # Limit to first 10 for performance
@@ -134,16 +272,22 @@ def detect_drift_evidently(
             'feature_drift_scores': feature_drift_scores,
             'full_report': dataset_drift_result if dataset_drift_result else drift_table_result,
             'drift_table': drift_table_result,
-            'column_drifts': column_drifts
+            'column_drifts': column_drifts,
+            'method': 'evidently'
         }
     except Exception as e:
-        return {
-            'error': str(e),
-            'dataset_drifted': False,
-            'number_of_drifted_features': 0,
-            'share_of_drifted_features': 0.0,
-            'feature_drift_scores': {}
-        }
+        # If Evidently fails, fall back to statistical tests
+        try:
+            return _detect_drift_statistical(reference_data, current_data, threshold)
+        except Exception as e2:
+            return {
+                'error': f"Evidently error: {str(e)}, Statistical fallback error: {str(e2)}",
+                'dataset_drifted': False,
+                'number_of_drifted_features': 0,
+                'share_of_drifted_features': 0.0,
+                'feature_drift_scores': {},
+                'method': 'error'
+            }
 
 
 def detect_drift_deepchecks(
