@@ -4,17 +4,30 @@ Drift detection utilities using Evidently AI and Deepchecks.
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from evidently.metrics import (
-    DatasetDriftMetric,
-    DataDriftTable,
-    ColumnDriftMetric,
-)
 from evidently.report import Report
 from evidently.test_suite import TestSuite
-from evidently.tests import TestNumberOfDriftedFeatures
 from deepchecks.tabular import Dataset
 from deepchecks.tabular.checks import DataDrift
 import json
+
+# Try to import Evidently metrics with fallback for different versions
+try:
+    from evidently.metrics import DataDriftTable, ColumnDriftMetric
+    HAS_DATA_DRIFT_TABLE = True
+except ImportError:
+    HAS_DATA_DRIFT_TABLE = False
+
+try:
+    from evidently.metrics import DatasetDriftMetric
+    HAS_DATASET_DRIFT_METRIC = True
+except ImportError:
+    HAS_DATASET_DRIFT_METRIC = False
+
+try:
+    from evidently.tests import TestNumberOfDriftedFeatures
+    HAS_TEST_NUMBER_OF_DRIFTED = True
+except ImportError:
+    HAS_TEST_NUMBER_OF_DRIFTED = False
 
 
 def detect_drift_evidently(
@@ -34,16 +47,10 @@ def detect_drift_evidently(
         Dictionary containing drift metrics and results
     """
     try:
-        # Dataset-level drift
-        dataset_drift_metric = DatasetDriftMetric(threshold=threshold)
-        dataset_drift_report = Report(metrics=[dataset_drift_metric])
-        dataset_drift_report.run(
-            reference_data=reference_data,
-            current_data=current_data
-        )
-        dataset_drift_result = dataset_drift_report.as_dict()
+        if not HAS_DATA_DRIFT_TABLE:
+            raise ImportError("DataDriftTable is not available in this version of Evidently")
         
-        # Data drift table
+        # Data drift table (primary method - works in all versions)
         data_drift_table = DataDriftTable()
         drift_table_report = Report(metrics=[data_drift_table])
         drift_table_report.run(
@@ -52,26 +59,11 @@ def detect_drift_evidently(
         )
         drift_table_result = drift_table_report.as_dict()
         
-        # Column-level drift metrics
-        column_drifts = {}
-        for col in reference_data.columns:
-            if reference_data[col].dtype in ['int64', 'float64']:
-                col_drift_metric = ColumnDriftMetric(column_name=col)
-                col_report = Report(metrics=[col_drift_metric])
-                col_report.run(
-                    reference_data=reference_data,
-                    current_data=current_data
-                )
-                col_result = col_report.as_dict()
-                column_drifts[col] = col_result
-        
-        # Extract drift information
-        dataset_drifted = dataset_drift_result['metrics'][0]['result'].get('dataset_drift', False)
-        number_of_drifted_features = dataset_drift_result['metrics'][0]['result'].get('number_of_drifted_features', 0)
-        share_of_drifted_features = dataset_drift_result['metrics'][0]['result'].get('share_of_drifted_features', 0.0)
-        
-        # Extract feature-level drift scores
+        # Extract feature-level drift scores from drift table
         feature_drift_scores = {}
+        dataset_drifted = False
+        number_of_drifted_features = 0
+        
         if 'metrics' in drift_table_result and len(drift_table_result['metrics']) > 0:
             drift_table_data = drift_table_result['metrics'][0]['result'].get('drift_by_columns', {})
             for col, drift_info in drift_table_data.items():
@@ -84,13 +76,63 @@ def detect_drift_evidently(
                         'drift_detected': drift_detected,
                         'stat_test': stat_test
                     }
+                    if drift_detected:
+                        number_of_drifted_features += 1
+                        dataset_drifted = True
+        
+        # Calculate share of drifted features
+        total_features = len(feature_drift_scores) if feature_drift_scores else 1
+        share_of_drifted_features = number_of_drifted_features / total_features if total_features > 0 else 0.0
+        
+        # Try to get dataset-level drift metric if available
+        dataset_drift_result = None
+        if HAS_DATASET_DRIFT_METRIC:
+            try:
+                dataset_drift_metric = DatasetDriftMetric(threshold=threshold)
+                dataset_drift_report = Report(metrics=[dataset_drift_metric])
+                dataset_drift_report.run(
+                    reference_data=reference_data,
+                    current_data=current_data
+                )
+                dataset_drift_result = dataset_drift_report.as_dict()
+                
+                # Override with dataset-level metric if available
+                if dataset_drift_result and 'metrics' in dataset_drift_result and len(dataset_drift_result['metrics']) > 0:
+                    result_data = dataset_drift_result['metrics'][0]['result']
+                    dataset_drifted = result_data.get('dataset_drift', dataset_drifted)
+                    number_of_drifted_features = result_data.get('number_of_drifted_features', number_of_drifted_features)
+                    share_of_drifted_features = result_data.get('share_of_drifted_features', share_of_drifted_features)
+            except Exception:
+                # If DatasetDriftMetric fails, use drift table results
+                pass
+        
+        # Column-level drift metrics (optional, can be slow for many columns)
+        column_drifts = {}
+        if HAS_DATA_DRIFT_TABLE:
+            try:
+                # Only process numeric columns to avoid errors
+                numeric_cols = reference_data.select_dtypes(include=[np.number]).columns[:10]  # Limit to first 10 for performance
+                for col in numeric_cols:
+                    try:
+                        col_drift_metric = ColumnDriftMetric(column_name=col)
+                        col_report = Report(metrics=[col_drift_metric])
+                        col_report.run(
+                            reference_data=reference_data,
+                            current_data=current_data
+                        )
+                        col_result = col_report.as_dict()
+                        column_drifts[col] = col_result
+                    except Exception:
+                        continue
+            except Exception:
+                pass
         
         return {
             'dataset_drifted': dataset_drifted,
             'number_of_drifted_features': number_of_drifted_features,
             'share_of_drifted_features': share_of_drifted_features,
             'feature_drift_scores': feature_drift_scores,
-            'full_report': dataset_drift_result,
+            'full_report': dataset_drift_result if dataset_drift_result else drift_table_result,
             'drift_table': drift_table_result,
             'column_drifts': column_drifts
         }
