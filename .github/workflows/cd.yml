@@ -1,0 +1,34 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  deploy-streamlit:
+    name: Deploy to Streamlit Cloud
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      
+      - name: Verify deployment readiness
+        run: |
+          python -c "import streamlit; print('Streamlit version:', streamlit.__version__)"
+          python -c "from utils.drift_utils import *; print('Utils imported successfully')"
+      
+      - name: Notify deployment
+        run: |
+          echo "✅ Code is ready for Streamlit Cloud deployment"
+          echo "Configure Streamlit Cloud to auto-deploy from this repository"
+
