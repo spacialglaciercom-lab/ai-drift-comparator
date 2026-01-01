@@ -1,37 +1,27 @@
 """
 Drift detection utilities using Evidently AI and Deepchecks.
 """
+# CRITICAL: Import sklearn patch BEFORE importing deepchecks
+# This registers 'max_error' scorer before deepchecks tries to use it
+from utils._sklearn_patch import *  # noqa: F401, F403
+
+# Now safe to import other modules
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from deepchecks.tabular import Dataset
-from deepchecks.tabular.checks import DataDrift
-import json
 
-# Fix for 'max_error' scorer issue in scikit-learn
-# Some libraries (Evidently/Deepchecks) may try to use 'max_error' as a scorer
-# but it's not registered by default - we need to register it
+# Import deepchecks with error handling
 try:
-    from sklearn.metrics._scorer import _SCORERS
-    from sklearn.metrics import make_scorer
-    
-    # Register 'max_error' as a scorer if it doesn't exist
-    if 'max_error' not in _SCORERS:
-        try:
-            # Try to import max_error function directly
-            from sklearn.metrics import max_error as max_error_func
-            max_error_scorer = make_scorer(max_error_func, greater_is_better=False)
-            _SCORERS['max_error'] = max_error_scorer
-        except ImportError:
-            # If max_error function doesn't exist, create a simple implementation
-            def max_error_func(y_true, y_pred):
-                """Calculate maximum error between true and predicted values."""
-                return np.max(np.abs(y_true - y_pred))
-            max_error_scorer = make_scorer(max_error_func, greater_is_better=False)
-            _SCORERS['max_error'] = max_error_scorer
-except Exception:
-    # If sklearn.metrics is not available, continue without the fix
-    pass
+    from deepchecks.tabular import Dataset
+    from deepchecks.tabular.checks import DataDrift
+    HAS_DEEPCHECKS = True
+except ImportError:
+    # If deepchecks import fails, set flags and continue
+    HAS_DEEPCHECKS = False
+    Dataset = None
+    DataDrift = None
+
+import json
 
 # Try to import Evidently with fallback for different versions
 HAS_EVIDENTLY = False
@@ -331,6 +321,10 @@ def detect_drift_deepchecks(
     Returns:
         Dictionary containing drift metrics and results
     """
+    if not HAS_DEEPCHECKS or Dataset is None or DataDrift is None:
+        # Fallback to statistical tests if deepchecks is not available
+        return _detect_drift_statistical(reference_data, current_data, threshold=0.05)
+    
     try:
         # Create Deepchecks Dataset objects
         cat_features = reference_data.select_dtypes(include=['object', 'category']).columns.tolist()

@@ -18,6 +18,10 @@ from io import StringIO
 # Add utils to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+# CRITICAL: Import sklearn patch FIRST to register 'max_error' scorer
+# This must happen before any imports that use deepchecks or evidently
+from utils._sklearn_patch import *  # noqa: F401, F403
+
 from utils.drift_utils import (
     detect_drift_evidently,
     detect_drift_deepchecks,
